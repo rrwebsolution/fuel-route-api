@@ -1,10 +1,15 @@
+import json
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlencode
 
 from django.db import DatabaseError, connection
 from django.db.models import Q
+from django.shortcuts import render
+from django.urls import reverse
 from rest_framework import generics, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
+from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -25,14 +30,36 @@ class RouteView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        start, finish = serializer.validated_data["start"], serializer.validated_data["finish"]
         try:
-            result = plan_trip(serializer.validated_data["start"], serializer.validated_data["finish"])
+            result = plan_trip(start, finish)
         except TripPlanningError as exc:
             return Response(
                 {"error": {"code": exc.code, "message": exc.message, **exc.details}},
                 status=exc.status_code,
             )
+        result["map_url"] = request.build_absolute_uri(
+            reverse("route-map") + "?" + urlencode({"start": start, "finish": finish})
+        )
         return Response(result)
+
+
+def route_map(request):
+    """
+    GET /api/routes/map/?start=...&finish=...: an interactive map (Leaflet + OpenStreetMap)
+    of the route and its fuel stops. Uses the same cached geocoding/route as the JSON API.
+    """
+    serializer = RouteRequestSerializer(data=request.GET)
+    if not serializer.is_valid():
+        message = "; ".join(f"{field}: {' '.join(map(str, errors))}" for field, errors in serializer.errors.items())
+        return render(request, "routing/route_map.html", {"error": message}, status=400)
+    try:
+        result = plan_trip(serializer.validated_data["start"], serializer.validated_data["finish"])
+    except TripPlanningError as exc:
+        return render(request, "routing/route_map.html", {"error": exc.message}, status=exc.status_code)
+    # Round-trip through DRF's renderer so Decimals become plain JSON numbers.
+    trip = json.loads(JSONRenderer().render(result))
+    return render(request, "routing/route_map.html", {"trip": trip})
 
 
 class StationPagination(PageNumberPagination):

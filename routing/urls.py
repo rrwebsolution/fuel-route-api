@@ -1,11 +1,12 @@
 from django.urls import re_path
 
-from .views import FuelStationDetailView, FuelStationListView, HealthView, RouteView
+from .views import FuelStationDetailView, FuelStationListView, HealthView, RouteView, route_map
 
 # Trailing slash is optional so e.g. /api/health and /api/health/ both work (also for POST).
 urlpatterns = [
     re_path(r"^health/?$", HealthView.as_view(), name="health"),
     re_path(r"^routes/calculate/?$", RouteView.as_view(), name="route-calculate"),
+    re_path(r"^routes/map/?$", route_map, name="route-map"),
     re_path(r"^fuel-stations/?$", FuelStationListView.as_view(), name="fuel-station-list"),
     re_path(r"^fuel-stations/(?P<opis_id>\d+)/?$", FuelStationDetailView.as_view(), name="fuel-station-detail"),
     # Older aliases kept for compatibility.

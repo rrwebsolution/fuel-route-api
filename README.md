@@ -8,7 +8,8 @@ POST /api/routes/calculate/   {"start": "New York, NY", "finish": "Los Angeles, 
 ```
 
 returns the route geometry (GeoJSON, ready for Leaflet/Mapbox/Google Maps), distance,
-duration, the fuel stops to make, how many gallons to buy at each, and the total fuel cost.
+duration, the fuel stops to make, how many gallons to buy at each, and the fuel cost.
+It also returns a `map_url`: an interactive map of the route with every fuel stop marked.
 
 ---
 
@@ -34,8 +35,10 @@ config/                     Django project (settings read from environment / .en
 routing/
     models.py               FuelStation model + indexes
     serializers.py          Route request + fuel station validation
-    views.py                Thin views: route calculation, fuel-station CRUD, health
-    urls.py                 /api/health/, /api/routes/calculate/, /api/fuel-stations/
+    views.py                Thin views: route calculation, route map, fuel-station CRUD, health
+    urls.py                 /api/health/, /api/routes/calculate/, /api/routes/map/, /api/fuel-stations/
+    templates/routing/
+        route_map.html      Leaflet + OpenStreetMap page for the route and fuel stops
     services/
         trip_planner.py     Orchestrates geocode -> route -> stations -> fuel plan
         geocoding_service.py  Nominatim geocoding (USA only, cached)
@@ -43,7 +46,7 @@ routing/
         station_service.py  Stations within the route corridor (1 DB query)
         fuel_optimizer.py   Pure fuel-stop optimisation (Decimal maths)
         geo.py              Haversine, route resampling + grid index, line simplification
-        city_coordinates.py Offline city/state -> lat/lon lookup for the import
+        city_coordinates.py Offline city/state -> lat/lon lookup (CSV import + station API)
         http.py             Shared HTTP helper: timeouts and error translation
         exceptions.py       Domain errors, each with an HTTP status
     management/commands/
@@ -78,13 +81,17 @@ few small pure-Python functions.
 
 - Python 3.12+
 - MySQL 8.4+ or MariaDB 10.11+. Django 6.1 refuses older servers, so XAMPP's bundled
-  MariaDB 10.4 will **not** work.
+  MariaDB 10.4 will **not** work as is. Either install MariaDB 11+/MySQL 8.4+, or upgrade
+  XAMPP's MySQL: back up your databases with `mysqldump`, replace `xampp/mysql/bin`,
+  `lib` and `share` with a newer MariaDB build, and restore the dumps.
+- The server's `sql_mode` doesn't matter: the app enables `STRICT_TRANS_TABLES` on its own
+  connections, so XAMPP's non-strict default is fine.
 - Internet access for OSRM and Nominatim. Tests do not need it.
 
 ### 1. Install
 
 ```bash
-git clone <repo-url> fuel-route-api
+git clone https://github.com/rrwebsolution/fuel-route-api.git
 cd fuel-route-api
 python -m venv venv
 # Windows: venv\Scripts\activate     macOS/Linux: source venv/bin/activate
@@ -238,8 +245,12 @@ Result on the supplied file: **6,626 stations** imported in about 1 second.
   ],
   "total_gallons": 50.435,
   "total_fuel_cost": 142.12,
+  "total_trip_fuel_cost": 312.07,
   "fuel_summary": {
     "starting_fuel_gallons": 50.0,
+    "starting_fuel_used_gallons": 50.0,
+    "starting_fuel_price_per_gallon": 3.399,
+    "starting_fuel_cost": 169.95,
     "fuel_used_gallons": 100.435,
     "fuel_remaining_at_finish_gallons": 0.0,
     "stations_along_route": 200
@@ -250,23 +261,31 @@ Result on the supplied file: **6,626 stations** imported in about 1 second.
     "start_tank_fraction": 1.0,
     "station_corridor_miles": 10.0,
     "min_savings_per_gallon": 0.1
-  }
+  },
+  "map_url": "http://127.0.0.1:8000/api/routes/map?start=Chicago%2C+IL&finish=Denver%2C+CO"
 }
 ```
 
 - `route` is a GeoJSON `LineString` in `[longitude, latitude]` order. It can be drawn as is,
   for example with `L.geoJSON(response.route)` in Leaflet.
-- `total_gallons` / `total_fuel_cost` are what is **bought** on the trip. The fuel already
-  in the tank at departure is reported separately in `fuel_summary`.
+- **Two fuel costs are returned:**
+  - `total_fuel_cost` is the money spent at the fuel stops on the way (`total_gallons`
+    bought). The truck leaves with a full tank, so a trip under 500 miles needs no stop
+    and this is `$0`.
+  - `total_trip_fuel_cost` is the cost of **all** the fuel the trip burns
+    (`distance / 10 MPG`): `total_fuel_cost` plus the fuel used from the starting tank,
+    valued at the first station along the route, where the driver would have filled up
+    before leaving. The breakdown is in `fuel_summary`.
+- `map_url` opens the route map (see below).
 - `price_per_gallon` is the exact price from the CSV. `cost` is `gallons × price`,
   rounded to the cent per stop, and `total_fuel_cost` is the sum of those rounded costs.
 
-**Errors** always look like `{"error": {"code": "...", "message": "...", ...details}}`:
+**Errors** from the route calculation look like
+`{"error": {"code": "...", "message": "...", ...details}}`:
 
 | Status | `code` | When |
 |---|---|---|
-| 400 | `invalid_request` | Missing or blank `start`/`finish`, the same place twice, malformed JSON |
-| 405 | (DRF default) | Method other than POST |
+| 400 | `invalid_request` | Missing or blank `start`/`finish`, or the same place twice; `fields` lists the problems |
 | 422 | `location_not_found` | Location can't be found in the USA (e.g. `"Paris, France"`) |
 | 422 | `route_not_found` | No drivable route (e.g. Honolulu → Los Angeles) |
 | 422 | `no_fuel_stations` | The trip needs fuel but no station lies along the route |
@@ -274,12 +293,27 @@ Result on the supplied file: **6,626 stations** imported in about 1 second.
 | 502 | `external_service_error` | Geocoding/routing provider error or bad response |
 | 504 | `external_service_timeout` | Geocoding/routing provider timed out |
 
+Malformed JSON (`400`) and an unsupported method such as GET (`405`) are rejected by
+Django REST Framework before the view runs, so they return DRF's standard
+`{"detail": "..."}` body.
+
+### `GET /api/routes/map/?start=...&finish=...`
+
+An interactive map of the trip in the browser: the route line, start (A) and finish (B)
+pins, a numbered pin per fuel stop (station, price, gallons, cost), and a summary panel.
+It's built with Leaflet and OpenStreetMap tiles and reuses the cached geocoding and route,
+so opening it after a `POST` makes **no** extra external calls. Every
+`/api/routes/calculate/` response includes the link as `map_url`.
+
+Example: <http://127.0.0.1:8000/api/routes/map/?start=New%20York,%20NY&finish=Los%20Angeles,%20CA>
+
 ### All endpoints
 
 | Method | Endpoint | Purpose |
 |---|---|---|
 | `GET` | `/api/health/` | Check that the API and database are running |
 | `POST` | `/api/routes/calculate/` | Calculate the route, the fuel stops and the total fuel cost |
+| `GET` | `/api/routes/map/?start=&finish=` | Interactive map of the route and fuel stops (HTML) |
 | `GET` | `/api/fuel-stations/` | List fuel stations (paginated, filterable) |
 | `GET` | `/api/fuel-stations/{opis_id}/` | View one fuel station |
 | `POST` | `/api/fuel-stations/` | Add a fuel station |
@@ -296,6 +330,9 @@ Result on the supplied file: **6,626 stations** imported in about 1 second.
   (> 0), optional `rack_id`, optional `latitude` + `longitude`. If coordinates are omitted,
   they're filled in from the city/state, the same way as the CSV import. Changes take
   effect in route calculations straight away.
+- **Station errors** use DRF's standard format: `400` with one list of messages per field
+  (e.g. `{"state": ["Must be a two-letter US state code, e.g. TX."]}`), `404`
+  `{"detail": "No FuelStation matches the given query."}`.
 - `GET /api/health/` returns `{"status": "ok", "database": "ok", "fuel_stations": 6626,
   "fuel_stations_with_coordinates": 6618}`, or `503` if the database is down.
 
@@ -316,8 +353,10 @@ POST /api/fuel-stations/
 
 ### Postman
 
-Import `postman/fuel-route-api.postman_collection.json`. It contains long, medium and short
-routes, error cases, and the full fuel-station CRUD sequence (add → view → PUT → PATCH → delete), using the `baseUrl` variable (default `http://127.0.0.1:8000`).
+Import `postman/fuel-route-api.postman_collection.json`. It contains the health check,
+long, medium and short routes, the route map, two error cases, the station list and search, and the full
+fuel-station CRUD sequence (add → view → PUT → PATCH → delete). It uses the `baseUrl`
+variable (default `http://127.0.0.1:8000`).
 
 Or with curl:
 
@@ -405,8 +444,9 @@ ties (and skipping a top-up when the tank already reaches the next chosen statio
 - **Vehicle:** 500-mile maximum range and 10 MPG, so a 50-gallon tank
   (`VEHICLE_MAX_RANGE_MILES`, `VEHICLE_MPG` in `config/settings.py`).
 - **The vehicle departs with a full tank** (`VEHICLE_START_TANK_FRACTION=1.0`). That fuel
-  isn't counted as a purchase, so trips under 500 miles need no stops and cost $0 in
-  purchases. Fuel used for the whole trip is still shown in `fuel_summary.fuel_used_gallons`.
+  isn't a purchase on the way, so trips under 500 miles need no stops and
+  `total_fuel_cost` is $0. `total_trip_fuel_cost` still prices all fuel burned, valuing the
+  starting tank at the first station along the route.
   Values below 1.0 are supported. With `0`, a station would have to be at mile 0.
 - **Arrive empty:** the plan buys only what is needed to reach the destination.
 - **Station location is the city centroid**, because the CSV has no coordinates. The
@@ -444,12 +484,13 @@ Measured locally (New York → Los Angeles, 2,794 miles, 34,638 route vertices):
 python manage.py test routing
 ```
 
-59 tests (about 0.4 s) cover request validation, haversine and corridor maths, the fuel
+64 tests (about 0.4 s) cover request validation, haversine and corridor maths, the fuel
 optimiser (cheaper-ahead purchases, fill-ups, the 500-mile constraint on every leg, cost
 totals, the savings threshold and partial starting tanks), the CSV import (idempotency,
 duplicates, malformed and non-US rows, missing columns) and the API end to end, including
-every error status, plus the health endpoint and fuel-station CRUD (validation, PUT/PATCH, delete). External HTTP calls are mocked, so the tests run offline. One test
-checks that a request makes exactly 2 geocoding calls and 1 routing call, and none on repeat.
+every error status, plus the trip fuel cost, the route map page, the health endpoint
+and fuel-station CRUD (validation, PUT/PATCH, delete). External HTTP calls are mocked, so the tests run offline. One test checks that a
+request makes exactly 2 geocoding calls and 1 routing call, and none on repeat.
 
 Tests use a MySQL test database (`test_<DB_NAME>`), so the DB user needs `CREATE DATABASE`
 rights.

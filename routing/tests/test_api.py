@@ -180,3 +180,71 @@ class RouteApiTests(TestCase):
         response = self.post(FakeUpstream())
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["error"]["code"], "no_fuel_stations")
+
+
+@override_settings(
+    GEOCODING_URL="https://nominatim.test/search",
+    ROUTING_URL="https://osrm.test/route/v1/driving",
+    VEHICLE_START_TANK_FRACTION=1.0,
+    STATION_CORRIDOR_MILES=10,
+    FUEL_MIN_SAVINGS_PER_GALLON="0",
+)
+class TripCostAndMapTests(TestCase):
+    url = reverse("route")
+    body = {"start": "Flagstaff, AZ", "finish": "Memphis, TN"}
+
+    @classmethod
+    def setUpTestData(cls):
+        FuelStation.objects.bulk_create([
+            FuelStation(opis_id=i, name=f"Stop {i}", address=f"I-40 EXIT {i}", city="Town", state="OK",
+                        retail_price=Decimal(price), latitude=35.0, longitude=lon)
+            for i, lon, price in [(1, -104.0, "3.80"), (2, -102.0, "3.20"), (3, -96.0, "3.10")]
+        ])
+
+    def setUp(self):
+        cache.clear()
+
+    def post(self, upstream):
+        with mock.patch.object(http._session, "get", side_effect=upstream):
+            return self.client.post(self.url, self.body, content_type="application/json")
+
+    def test_trip_cost_includes_starting_tank(self):
+        data = self.post(FakeUpstream()).json()
+        summary = data["fuel_summary"]
+        # The whole 50-gallon starting tank is burned; it is valued at the first station (3.80).
+        self.assertEqual(summary["starting_fuel_used_gallons"], 50.0)
+        self.assertEqual(summary["starting_fuel_price_per_gallon"], 3.8)
+        self.assertEqual(summary["starting_fuel_cost"], 190.0)
+        self.assertAlmostEqual(data["total_trip_fuel_cost"], data["total_fuel_cost"] + 190.0, places=2)
+
+    def test_short_trip_has_a_trip_cost_even_without_stops(self):
+        payload = osrm_ok()
+        payload["routes"][0]["distance"] = 300 * 1609.344  # 300 miles: no stop needed
+        data = self.post(FakeUpstream(route_payload=payload)).json()
+        self.assertEqual(data["fuel_stops"], [])
+        self.assertEqual(data["total_fuel_cost"], 0)
+        self.assertEqual(data["fuel_summary"]["starting_fuel_used_gallons"], 30.0)
+        self.assertEqual(data["total_trip_fuel_cost"], 114.0)  # 30 gal x 3.80
+
+    def test_response_links_to_map(self):
+        data = self.post(FakeUpstream()).json()
+        self.assertTrue(data["map_url"].startswith("http://testserver/api/routes/map?"))
+        self.assertIn("start=Flagstaff%2C+AZ", data["map_url"])
+
+    def test_map_page_renders_route_and_stops_from_cache(self):
+        upstream = FakeUpstream()
+        map_url = self.post(upstream).json()["map_url"]
+        with mock.patch.object(http._session, "get", side_effect=upstream):
+            response = self.client.get(map_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "text/html; charset=utf-8")
+        self.assertContains(response, 'id="trip-data"')
+        self.assertContains(response, "Stop 2")
+        self.assertEqual(upstream.calls, {"geocode": 2, "route": 1}, "map page must reuse the cached route")
+
+    def test_map_page_errors(self):
+        self.assertEqual(self.client.get("/api/routes/map/?start=Memphis, TN").status_code, 400)
+        with mock.patch.object(http._session, "get", side_effect=FakeUpstream()):
+            response = self.client.get("/api/routes/map/?start=Toronto, ON&finish=Memphis, TN")
+        self.assertEqual(response.status_code, 422)
+        self.assertContains(response, "Could not find", status_code=422)

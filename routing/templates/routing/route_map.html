@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if trip %}{{ trip.start.query }} → {{ trip.finish.query }} · {% endif %}Fuel Route Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    :root { --ink: #1f2933; --muted: #616e7c; --line: #e4e7eb; --accent: #2563eb; --fuel: #d97706; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); background: #fff; }
+    .layout { display: flex; height: 100%; }
+    aside { width: 380px; max-width: 100%; overflow-y: auto; border-right: 1px solid var(--line); padding: 16px; }
+    #map { flex: 1; min-height: 320px; }
+    h1 { font-size: 17px; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin: 0 0 14px; }
+    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
+    .stat { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+    .stat b { display: block; font-size: 16px; font-variant-numeric: tabular-nums; }
+    .stat span { color: var(--muted); font-size: 12px; }
+    ol { list-style: none; padding: 0; margin: 0; }
+    li.stop { display: flex; gap: 10px; padding: 10px 0; border-top: 1px solid var(--line); cursor: pointer; }
+    .badge { flex: none; width: 24px; height: 24px; border-radius: 50%; background: var(--fuel); color: #fff;
+             font-weight: 700; font-size: 12px; display: grid; place-items: center; }
+    .stop small { color: var(--muted); display: block; }
+    .num { font-variant-numeric: tabular-nums; }
+    .note { color: var(--muted); font-size: 12px; margin-top: 14px; }
+    .error { max-width: 560px; margin: 15vh auto; padding: 20px; border: 1px solid #f5c2c0; background: #fef2f2; border-radius: 8px; }
+    .pin { width: 26px; height: 26px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.4);
+           color: #fff; font: 700 12px/22px system-ui, sans-serif; text-align: center; }
+    @media (max-width: 760px) {
+      .layout { flex-direction: column-reverse; }
+      aside { width: 100%; border-right: 0; border-top: 1px solid var(--line); height: 50%; }
+    }
+  </style>
+</head>
+<body>
+{% if error %}
+  <div class="error">
+    <h1>Could not plan this route</h1>
+    <p>{{ error }}</p>
+    <p class="sub">Example: <code>/api/routes/map/?start=New York, NY&amp;finish=Los Angeles, CA</code></p>
+  </div>
+{% else %}
+  <div class="layout">
+    <aside>
+      <h1>{{ trip.start.query }} → {{ trip.finish.query }}</h1>
+      <p class="sub">{{ trip.distance_miles }} mi · {{ trip.duration }} driving</p>
+      <div class="stats">
+        <div class="stat"><b>${{ trip.total_fuel_cost|floatformat:2 }}</b><span>fuel bought on the way</span></div>
+        <div class="stat"><b>${{ trip.total_trip_fuel_cost|floatformat:2 }}</b><span>total trip fuel cost</span></div>
+        <div class="stat"><b>{{ trip.fuel_stops|length }}</b><span>fuel stops</span></div>
+        <div class="stat"><b>{{ trip.total_gallons|floatformat:1 }} gal</b><span>gallons bought</span></div>
+      </div>
+      <ol id="stops">
+        {% for stop in trip.fuel_stops %}
+          <li class="stop" data-index="{{ forloop.counter0 }}">
+            <div class="badge">{{ forloop.counter }}</div>
+            <div>
+              <strong>{{ stop.station_name }}</strong>
+              <small>{{ stop.address }}, {{ stop.city }}, {{ stop.state }}</small>
+              <small class="num">mile {{ stop.distance_from_start_miles }} · ${{ stop.price_per_gallon }}/gal ·
+                {{ stop.gallons|floatformat:1 }} gal · <b>${{ stop.cost|floatformat:2 }}</b></small>
+            </div>
+          </li>
+        {% empty %}
+          <li class="stop">No stop needed: the trip fits in the starting tank ({{ trip.assumptions.max_range_miles }}-mile range).</li>
+        {% endfor %}
+      </ol>
+      <p class="note">
+        Assumes a {{ trip.assumptions.max_range_miles }}-mile range at {{ trip.assumptions.miles_per_gallon }} MPG,
+        starting with a full tank. Station pins sit at the city centre of each truck stop.
+      </p>
+    </aside>
+    <div id="map"></div>
+  </div>
+  {{ trip|json_script:"trip-data" }}
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const trip = JSON.parse(document.getElementById("trip-data").textContent);
+    const map = L.map("map");
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 18,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    }).addTo(map);
+
+    const route = L.geoJSON(trip.route, { style: { color: "#2563eb", weight: 5, opacity: 0.85 } }).addTo(map);
+    map.fitBounds(route.getBounds(), { padding: [30, 30] });
+
+    const pin = (label, color) => L.divIcon({
+      className: "", iconSize: [26, 26], iconAnchor: [13, 13],
+      html: `<div class="pin" style="background:${color}">${label}</div>`,
+    });
+    const escape = (text) => String(text).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+    L.marker([trip.start.latitude, trip.start.longitude], { icon: pin("A", "#16a34a") })
+      .bindPopup(`<b>Start</b><br>${escape(trip.start.display_name)}`).addTo(map);
+    L.marker([trip.finish.latitude, trip.finish.longitude], { icon: pin("B", "#dc2626") })
+      .bindPopup(`<b>Finish</b><br>${escape(trip.finish.display_name)}`).addTo(map);
+
+    const stopMarkers = trip.fuel_stops.map((stop, i) =>
+      L.marker([stop.latitude, stop.longitude], { icon: pin(i + 1, "#d97706") })
+        .bindPopup(
+          `<b>${i + 1}. ${escape(stop.station_name)}</b><br>${escape(stop.address)}, ${escape(stop.city)}, ${escape(stop.state)}` +
+          `<br>Mile ${stop.distance_from_start_miles} · $${stop.price_per_gallon}/gal` +
+          `<br>${stop.gallons.toFixed(1)} gal = <b>$${stop.cost.toFixed(2)}</b>`
+        )
+        .addTo(map)
+    );
+
+    document.querySelectorAll("li.stop[data-index]").forEach((item) => {
+      item.addEventListener("click", () => {
+        const marker = stopMarkers[Number(item.dataset.index)];
+        map.setView(marker.getLatLng(), 10);
+        marker.openPopup();
+      });
+    });
+  </script>
+{% endif %}
+</body>
+</html>

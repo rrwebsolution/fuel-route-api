@@ -5,13 +5,13 @@ External calls per request (uncached): 2 geocoding + 1 routing. Repeated request
 for the same places are served from cache with zero external calls.
 """
 
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from django.conf import settings
 
 from . import geocoding_service, routing_service
 from .exceptions import RouteNotFoundError
-from .fuel_optimizer import plan_fuel_stops
+from .fuel_optimizer import CENTS, plan_fuel_stops
 from .geo import RouteIndex, simplify_line
 from .station_service import find_stations_along_route
 
@@ -41,6 +41,7 @@ def plan_trip(start_query, finish_query):
     )
 
     fuel_remaining = plan.starting_fuel_gallons + plan.total_gallons - plan.fuel_used_gallons
+    trip_cost = trip_fuel_cost(plan, stations)
     return {
         "start": _location(start),
         "finish": _location(finish),
@@ -54,8 +55,12 @@ def plan_trip(start_query, finish_query):
         "fuel_stops": [_fuel_stop(stop) for stop in plan.stops],
         "total_gallons": plan.total_gallons.quantize(GALLON_PRECISION),
         "total_fuel_cost": plan.total_cost,
+        "total_trip_fuel_cost": trip_cost["total"],
         "fuel_summary": {
             "starting_fuel_gallons": plan.starting_fuel_gallons.quantize(GALLON_PRECISION),
+            "starting_fuel_used_gallons": trip_cost["starting_fuel_used"].quantize(GALLON_PRECISION),
+            "starting_fuel_price_per_gallon": trip_cost["starting_price"],
+            "starting_fuel_cost": trip_cost["starting_cost"],
             "fuel_used_gallons": plan.fuel_used_gallons.quantize(GALLON_PRECISION),
             "fuel_remaining_at_finish_gallons": fuel_remaining.quantize(GALLON_PRECISION),
             "stations_along_route": len(stations),
@@ -67,6 +72,28 @@ def plan_trip(start_query, finish_query):
             "station_corridor_miles": settings.STATION_CORRIDOR_MILES,
             "min_savings_per_gallon": Decimal(settings.FUEL_MIN_SAVINGS_PER_GALLON),
         },
+    }
+
+
+def trip_fuel_cost(plan, stations):
+    """
+    Cost of all the fuel the trip burns, not just what is bought on the way.
+
+    Fuel bought at stops is used up by the finish, so the rest of the fuel burned came
+    from the starting tank. That fuel is valued at the first station along the route,
+    i.e. where the driver would have filled up before leaving.
+    """
+    starting_fuel_used = max(plan.fuel_used_gallons - plan.total_gallons, Decimal("0"))
+    if not stations:
+        return {"total": None, "starting_fuel_used": starting_fuel_used,
+                "starting_price": None, "starting_cost": None}
+    starting_price = stations[0].price
+    starting_cost = (starting_fuel_used * starting_price).quantize(CENTS, rounding=ROUND_HALF_UP)
+    return {
+        "total": plan.total_cost + starting_cost,
+        "starting_fuel_used": starting_fuel_used,
+        "starting_price": starting_price.normalize(),
+        "starting_cost": starting_cost,
     }
 
 
